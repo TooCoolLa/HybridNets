@@ -26,7 +26,7 @@ device = 'cuda' if args.cuda else 'cpu'
 print('device', device)
 params = Params(f'projects/{args.project}.yml')
 weight = args.load_weights
-weight = torch.load(weight, map_location=device)
+weight = torch.load(weight, map_location=device, weights_only=False)
 if weight.get("optimizer"):  # strip optimizer
     weight = OrderedDict((k[6:], v) for k, v in weight['model'].items())
 weight_last_layer_seg = weight['segmentation_head.0.weight']
@@ -47,7 +47,7 @@ model = HybridNetsBackbone(num_classes=len(params.obj_list),
                            seg_mode=seg_mode,
                            onnx_export=True)
 
-model.load_state_dict(torch.load(weight, map_location=device))
+model.load_state_dict(weight)
 model.eval()
 
 inputs = torch.randn(1, 3, args.height, args.width)

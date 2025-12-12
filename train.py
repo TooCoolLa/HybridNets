@@ -165,7 +165,7 @@ def train(opt):
         #     last_step = 0
 
         try:
-            ckpt = torch.load(weights_path)
+            ckpt = torch.load(weights_path, weights_only=False)
             # new_weight = OrderedDict((k[6:], v) for k, v in ckpt['model'].items())
             model.load_state_dict(ckpt.get('model', ckpt), strict=False)
         except RuntimeError as e:
@@ -210,7 +210,7 @@ def train(opt):
     else:
         optimizer = torch.optim.SGD(model.parameters(), opt.lr, momentum=0.9, nesterov=True)
     # print(ckpt)
-    scaler = torch.cuda.amp.GradScaler(enabled=opt.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=opt.amp)
     # if opt.load_weights is not None and ckpt.get('optimizer', None):
         # scaler.load_state_dict(ckpt['scaler'])
         # optimizer.load_state_dict(ckpt['optimizer'])
@@ -250,7 +250,7 @@ def train(opt):
                         seg_annot = seg_annot.cuda()
 
                     optimizer.zero_grad(set_to_none=True)
-                    with torch.cuda.amp.autocast(enabled=opt.amp):
+                    with torch.amp.autocast('cuda', enabled=opt.amp):
                         cls_loss, reg_loss, seg_loss, regression, classification, anchors, segmentation = model(imgs, annot,
                                                                                                                 seg_annot,
                                                                                                                 obj_list=params.obj_list)
