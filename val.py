@@ -329,9 +329,9 @@ if __name__ == "__main__":
                                seg_mode=seg_mode)
     
     try:
-        model.load_state_dict(torch.load(weights_path))
+        model.load_state_dict(torch.load(weights_path, weights_only=False))
     except:
-        model.load_state_dict(torch.load(weights_path)['model'])
+        model.load_state_dict(torch.load(weights_path, weights_only=False)['model'])
     model = ModelWithLoss(model, debug=False)
     model.requires_grad_(False)
 

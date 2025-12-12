@@ -71,7 +71,7 @@ transform = transforms.Compose([
     normalize,
 ])
 # print(x.shape)
-weight = torch.load(weight, map_location='cuda' if use_cuda else 'cpu')
+weight = torch.load(weight, map_location='cuda' if use_cuda else 'cpu', weights_only=False)
 weight_last_layer_seg = weight.get('model', weight)['segmentation_head.0.weight']
 if weight_last_layer_seg.size(0) == 1:
     seg_mode = BINARY_MODE

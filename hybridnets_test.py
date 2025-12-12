@@ -110,7 +110,7 @@ else:
 
 x = x.to(torch.float16 if use_cuda and use_float16 else torch.float32)
 # print(x.shape)
-weight = torch.load(weight, map_location='cuda' if use_cuda else 'cpu')
+weight = torch.load(weight, map_location='cuda' if use_cuda else 'cpu', weights_only=False)
 #new_weight = OrderedDict((k[6:], v) for k, v in weight['model'].items())
 weight_last_layer_seg = weight['segmentation_head.0.weight']
 if weight_last_layer_seg.size(0) == 1:

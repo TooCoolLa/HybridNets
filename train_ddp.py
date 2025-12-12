@@ -132,7 +132,7 @@ def train(rank, opt):
         #     last_step = 0
 
         try:
-            ckpt = torch.load(weights_path)
+            ckpt = torch.load(weights_path, weights_only=False)
             model.load_state_dict(ckpt.get('model', ckpt), strict=False)
         except RuntimeError as e:
             print(f'[Warning] Ignoring {e}')
