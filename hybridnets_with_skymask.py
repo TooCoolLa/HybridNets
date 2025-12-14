@@ -14,11 +14,59 @@ import argparse
 from utils.constants import *
 from collections import OrderedDict
 from torch.nn import functional as F
+import onnxruntime
+from tqdm.auto import tqdm
+import copy
+# ==================== 配置参数 ====================
+MODEL_PATH = "/content/drive/MyDrive/models/skyseg.onnx"
+THRESHOLD = 32  # 天空分割阈值
+INPUT_SIZE = [320, 320]  # 模型输入尺寸
+SkyIsWhite = True  # 天空是否为白色
 
-try:
-    import onnxruntime
-except Exception:
-    onnxruntime = None
+INPUT_DIR = "./mymovies/001/images"
+OUTPUT_DIR = "./mymovies/001/skymasks"
+# ==================================================
+
+def run_skyseg(onnx_session, input_size, image):
+    temp_image = copy.deepcopy(image)
+    resize_image = cv2.resize(temp_image, dsize=(input_size[0], input_size[1]))
+    x = cv2.cvtColor(resize_image, cv2.COLOR_BGR2RGB)
+    x = np.array(x, dtype=np.float32)
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    x = (x / 255 - mean) / std
+    x = x.transpose(2, 0, 1)
+    x = x. reshape(-1, 3, input_size[0], input_size[1]). astype("float32")
+    input_name = onnx_session.get_inputs()[0].name
+    output_name = onnx_session. get_outputs()[0].name
+    onnx_result = onnx_session.run([output_name], {input_name: x})
+    onnx_result = np.array(onnx_result). squeeze()
+    min_value = np.min(onnx_result)
+    max_value = np.max(onnx_result)
+    onnx_result = (onnx_result - min_value) / (max_value - min_value)
+    onnx_result *= 255
+    onnx_result = onnx_result.astype("uint8")
+    return onnx_result
+
+def segment_sky(image_path, onnx_session, mask_filename, input_size=[320, 320], threshold=32):
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"无法读取图像: {image_path}")
+    result_map = run_skyseg(onnx_session, input_size, image)
+    result_map_original = cv2.resize(result_map, (image.shape[1], image.shape[0]))
+
+    if SkyIsWhite:
+        # 天空为白色(255)，背景为黑色(0)
+        output_mask = np.zeros_like(result_map_original)
+        output_mask[result_map_original < threshold] = 255
+    else:
+        # 天空为黑色(0)，背景为白色(255)
+        output_mask = np.zeros_like(result_map_original) * 255
+        output_mask[result_map_original < threshold] = 0
+
+    cv2.imwrite(mask_filename, output_mask)
+    return output_mask
+
 
 
 parser = argparse.ArgumentParser('HybridNets: End-to-End Perception Network - DatVu')
@@ -41,16 +89,24 @@ parser.add_argument('--cuda', type=boolean_string, default=True)
 parser.add_argument('--float16', type=boolean_string, default=True, help="Use float16 for faster inference")
 parser.add_argument('--speed_test', type=boolean_string, default=False,
                     help='Measure inference latency')
-parser.add_argument('--apply_skymask', type=boolean_string, default=False,
-                    help='If True and --skymodel given, run sky segmentation and set sky pixels to black in mask')
-parser.add_argument('--skymodel', type=str, default='', help='Path to ONNX sky segmentation model (optional)')
-parser.add_argument('--skythreshold', type=int, default=32, help='Threshold for sky segmentation (0-255)')
-parser.add_argument('--sky_input_size', type=str, default='320,320', help='ONNX sky model input size as H,W (comma separated)')
 args = parser.parse_args()
 
 params = Params(f'projects/{args.project}.yml')
 # names that indicate drivable area in segmentation labels (config dependent)
 # include common lane-related names so lane lines are also masked
+# 检查并创建目录
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"模型: {MODEL_PATH}\n输入: {INPUT_DIR}\n输出: {OUTPUT_DIR}\n")
+
+# 加载模型
+print("加载模型...")
+onnx_session = onnxruntime.InferenceSession(MODEL_PATH)
+print("✓ 模型加载成功\n")
+
+# 批量处理
+success_count = 0
+total_sky_percentage = 0
+
 DRIVABLE_NAMES = ['road', 'drivable', 'drivable_area', 'driveable', 'lane', 'lane_line', 'lanes']
 color_list_seg = {}
 for seg_class in params.seg_list:
@@ -275,70 +331,6 @@ with torch.no_grad():
                 if x2 > x1 and y2 > y1:
                     mask_img[y1:y2, x1:x2] = 0
             cv2.imwrite(f'{output}/{i}_mask.jpg', mask_img)
-
-            # optional: apply sky segmentation to force sky pixels to black in the mask
-            if args.apply_skymask and args.skymodel:
-                if onnxruntime is None:
-                    print('onnxruntime not installed; cannot apply sky mask')
-                else:
-                    # lazy load ONNX session once
-                    if '__onnx_session' not in globals() or globals().get('__onnx_session') is None:
-                        try:
-                            __onnx_session = onnxruntime.InferenceSession(args.skymodel)
-                            # parse input size
-                            try:
-                                sky_h, sky_w = [int(x) for x in args.sky_input_size.split(',')]
-                            except Exception:
-                                sky_h, sky_w = 320, 320
-                        except Exception as e:
-                            print(f'Failed to load skymodel {args.skymodel}: {e}')
-                            __onnx_session = None
-
-                    if '__onnx_session' in globals() and globals().get('__onnx_session') is not None:
-                        session = globals().get('__onnx_session')
-
-                        # img for sky model: convert ori_imgs (RGB) back to BGR
-                        img_bgr = cv2.cvtColor(ori_imgs[i], cv2.COLOR_RGB2BGR)
-
-                        def run_skyseg_on_image(session, input_size, image_bgr, threshold=32):
-                            h_inp, w_inp = input_size
-                            resize_image = cv2.resize(image_bgr, dsize=(w_inp, h_inp))
-                            x = cv2.cvtColor(resize_image, cv2.COLOR_BGR2RGB)
-                            x = np.array(x, dtype=np.float32)
-                            mean = [0.485, 0.456, 0.406]
-                            std = [0.229, 0.224, 0.225]
-                            x = (x / 255.0 - mean) / std
-                            x = x.transpose(2, 0, 1)
-                            x = x.reshape(1, 3, h_inp, w_inp).astype('float32')
-                            input_name = session.get_inputs()[0].name
-                            output_name = session.get_outputs()[0].name
-                            try:
-                                onnx_result = session.run([output_name], {input_name: x})
-                            except Exception as e:
-                                print('skymodel inference failed:', e)
-                                return None
-                            onnx_result = np.array(onnx_result).squeeze()
-                            mn = onnx_result.min()
-                            mx = onnx_result.max()
-                            if mx - mn > 1e-6:
-                                onnx_result = (onnx_result - mn) / (mx - mn)
-                            else:
-                                onnx_result = np.zeros_like(onnx_result)
-                            onnx_result = (onnx_result * 255).astype('uint8')
-                            seg_resized = cv2.resize(onnx_result, (image_bgr.shape[1], image_bgr.shape[0]))
-                            sky_mask = seg_resized >= args.skythreshold
-                            return sky_mask
-
-                        sky_mask = run_skyseg_on_image(session, (sky_h, sky_w), img_bgr, threshold=args.skythreshold)
-                        if sky_mask is None:
-                            pass
-                        else:
-                            # apply to in-memory mask_img and overwrite saved mask (use PNG to avoid compression)
-                            try:
-                                mask_img[sky_mask] = 0
-                                cv2.imwrite(f'{output}/{i}_mask.png', mask_img)
-                            except Exception as e:
-                                print('Failed to apply sky mask to output mask:', e)
 
         if show_det:
             cv2.imwrite(f'{output}/{i}_det.jpg',  cv2.cvtColor(det_only_imgs[i], cv2.COLOR_RGB2BGR))
