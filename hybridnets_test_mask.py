@@ -5,6 +5,7 @@ from backbone import HybridNetsBackbone
 import cv2
 import numpy as np
 from glob import glob
+from tqdm import tqdm
 from utils.utils import letterbox, scale_coords, postprocess, BBoxTransform, ClipBoxes, restricted_float, \
     boolean_string, Params
 from utils.plot import STANDARD_COLORS, standard_to_bgr, get_index_label, plot_one_box
@@ -137,7 +138,8 @@ transform = transforms.Compose([
     normalize,
 ])
 
-for ori_img in ori_imgs:
+print("Preprocessing images...")
+for ori_img in tqdm(ori_imgs, desc="Preprocessing", unit="img"):
     h0, w0 = ori_img.shape[:2]  # orig hw
     r = resized_shape / max(h0, w0) 
     input_img = cv2.resize(ori_img, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_AREA)
@@ -179,9 +181,11 @@ if use_cuda:
         model = model.half()
 
 with torch.no_grad():
+    print("Running model inference...")
     features, regression, classification, anchors, seg = model(x)
 
     # --- HybridNets Segmentation 处理 ---
+    print("Processing segmentation results...")
     seg_mask_list = []
     if seg_mode == BINARY_MODE:
         seg_mask = torch.where(seg >= 0, 1, 0)
@@ -196,7 +200,7 @@ with torch.no_grad():
 
     # 预处理 HybridNets 分割结果
     processed_seg_masks = [] 
-    for i in range(seg.size(0)):
+    for i in tqdm(range(seg.size(0)), desc="Segmentation", unit="img"):
         current_img_seg_mask = None
         for seg_class_index, seg_mask in enumerate(seg_mask_list):
             seg_mask_ = seg_mask[i].squeeze().cpu().numpy()
@@ -231,12 +235,14 @@ with torch.no_grad():
         processed_seg_masks.append(current_img_seg_mask)
 
     # --- HybridNets Detection 处理 ---
+    print("Postprocessing detections...")
     regressBoxes = BBoxTransform()
     clipBoxes = ClipBoxes()
     out = postprocess(x, anchors, regression, classification, regressBoxes, clipBoxes, threshold, iou_threshold)
 
     # --- 最终循环：坐标映射 + 生成 Result 和 Mask ---
-    for i in range(len(ori_imgs)):
+    print("Generating outputs...")
+    for i in tqdm(range(len(ori_imgs)), desc="Saving results", unit="img"):
         filename_with_ext = os.path.basename(img_path[i])
         filename, ext = os.path.splitext(filename_with_ext)
         h0, w0 = ori_imgs[i].shape[:2]
