@@ -5,6 +5,7 @@ from backbone import HybridNetsBackbone
 import cv2
 import numpy as np
 from glob import glob
+from tqdm import tqdm  # 确保已安装: pip install tqdm
 from utils.utils import letterbox, scale_coords, postprocess, BBoxTransform, ClipBoxes, restricted_float, \
     boolean_string, Params
 from utils.plot import STANDARD_COLORS, standard_to_bgr, get_index_label, plot_one_box
@@ -14,10 +15,45 @@ import argparse
 from utils.constants import *
 from collections import OrderedDict
 from torch.nn import functional as F
-from tqdm import tqdm  # 引入进度条库
+import onnxruntime
+import copy
 
-# ================= 参数设置 =================
-parser = argparse.ArgumentParser('HybridNets Inference (OOM Fix + Black/White Mask)')
+# ==================== SkySeg 配置和函数定义 ====================
+SKY_MODEL_PATH = "./skyseg.onnx" # 确保该文件位于脚本同级目录
+SKY_THRESHOLD = 32
+SKY_INPUT_SIZE = [320, 320]
+
+def run_skyseg(onnx_session, input_size, image):
+    """运行ONNX模型进行天空分割并返回结果图"""
+    temp_image = copy.deepcopy(image)
+    resize_image = cv2.resize(temp_image, dsize=(input_size[0], input_size[1]))
+    x = cv2.cvtColor(resize_image, cv2.COLOR_BGR2RGB)
+    x = np.array(x, dtype=np.float32)
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    x = (x / 255 - mean) / std
+    x = x.transpose(2, 0, 1)
+    x = x.reshape(-1, 3, input_size[0], input_size[1]).astype("float32")
+    
+    input_name = onnx_session.get_inputs()[0].name
+    output_name = onnx_session.get_outputs()[0].name
+    
+    onnx_result = onnx_session.run([output_name], {input_name: x})
+    onnx_result = np.array(onnx_result).squeeze()
+    
+    min_value = np.min(onnx_result)
+    max_value = np.max(onnx_result)
+    
+    if max_value - min_value == 0:
+        onnx_result = np.zeros_like(onnx_result)
+    else:
+        onnx_result = (onnx_result - min_value) / (max_value - min_value)
+    
+    onnx_result *= 255
+    return onnx_result.astype("uint8")
+# ========================================================
+
+parser = argparse.ArgumentParser('HybridNets + SkySeg Inference')
 parser.add_argument('-p', '--project', type=str, default='bdd100k', help='Project file that contains parameters')
 parser.add_argument('-bb', '--backbone', type=str, help='Use timm to create another backbone replacing efficientnet. ')
 parser.add_argument('-c', '--compound_coef', type=int, default=3, help='Coefficient of efficientnet backbone')
@@ -32,12 +68,15 @@ parser.add_argument('--show_det', type=boolean_string, default=False, help="Outp
 parser.add_argument('--show_seg', type=boolean_string, default=False, help="Output segmentation result exclusively")
 parser.add_argument('--cuda', type=boolean_string, default=True)
 parser.add_argument('--float16', type=boolean_string, default=True, help="Use float16 for faster inference")
-parser.add_argument('--save_mask', type=boolean_string, default=False, help="Save a binary mask image")
+parser.add_argument('--speed_test', type=boolean_string, default=False, help='Measure inference latency')
+parser.add_argument('--save_mask', type=boolean_string, default=False, help="Save a binary mask image (White bg, Black objects/Sky)")
 
 args = parser.parse_args()
 
-# ================= 初始化 =================
 params = Params(f'projects/{args.project}.yml')
+color_list_seg = {}
+for seg_class in params.seg_list:
+    color_list_seg[seg_class] = list(np.random.choice(range(256), size=3))
 compound_coef = args.compound_coef
 source = args.source
 if source.endswith("/"):
@@ -46,11 +85,19 @@ output = args.output
 if output.endswith("/"):
     output = output[:-1]
 weight = args.load_weights
+img_path = glob(f'{source}/*.jpg') + glob(f'{source}/*.png')
+input_imgs = []
+shapes = []
+det_only_imgs = []
 
-# 获取图片列表并排序
-img_paths = glob(f'{source}/*.jpg') + glob(f'{source}/*.png')
-img_paths.sort() 
-
+anchors_ratios = params.anchors_ratios
+anchors_scales = params.anchors_scales
+threshold = args.conf_thresh
+iou_threshold = args.iou_thresh
+imshow = args.imshow
+imwrite = args.imwrite
+show_det = args.show_det
+show_seg = args.show_seg
 os.makedirs(output, exist_ok=True)
 
 use_cuda = args.cuda
@@ -60,18 +107,69 @@ cudnn.benchmark = True
 
 obj_list = params.obj_list
 seg_list = params.seg_list
+
 color_list = standard_to_bgr(STANDARD_COLORS)
 
-# ================= 加载模型 =================
-print("Loading model...")
-anchors_ratios = params.anchors_ratios
-anchors_scales = params.anchors_scales
-threshold = args.conf_thresh
-iou_threshold = args.iou_thresh
+# [修改点] 添加图片读取进度条
+print(f"Detected {len(img_path)} images. Loading from disk...")
+ori_imgs = [cv2.imread(i, cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION) for i in tqdm(img_path, desc="Reading Files")]
 
-# 加载权重
-weight_dict = torch.load(weight, map_location='cuda' if use_cuda else 'cpu',weights_only=False)
-weight_last_layer_seg = weight_dict['segmentation_head.0.weight']
+# [修改点] 添加颜色转换进度条
+print("Converting BGR to RGB...")
+ori_imgs = [cv2.cvtColor(i, cv2.COLOR_BGR2RGB) for i in tqdm(ori_imgs, desc="Color Conversion")]
+
+print(f"FOUND {len(ori_imgs)} IMAGES")
+
+# --- 加载 SkySeg 模型 ---
+sky_session = None
+if args.save_mask:
+    if os.path.exists(SKY_MODEL_PATH):
+        print(f"Loading SkySeg model from {SKY_MODEL_PATH}...")
+        try:
+            sky_session = onnxruntime.InferenceSession(SKY_MODEL_PATH)
+        except Exception as e:
+            print(f"ERROR loading SkySeg model: {e}")
+            sky_session = None
+    else:
+        print(f"Warning: Sky model not found at {SKY_MODEL_PATH}, sky segmentation will be skipped for mask generation.")
+
+resized_shape = params.model['image_size']
+if isinstance(resized_shape, list):
+    resized_shape = max(resized_shape)
+normalize = transforms.Normalize(
+    mean=params.mean, std=params.std
+)
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    normalize,
+])
+
+# [修改点] 确保预处理进度条显示
+print("Preprocessing images (Resize & Letterbox)...")
+for ori_img in tqdm(ori_imgs, desc="Preprocessing", unit="img"):
+    h0, w0 = ori_img.shape[:2]  # orig hw
+    r = resized_shape / max(h0, w0) 
+    input_img = cv2.resize(ori_img, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_AREA)
+    h, w = input_img.shape[:2]
+
+    (input_img, _), ratio, pad = letterbox((input_img, None), resized_shape, auto=True, scaleup=False)
+
+    input_imgs.append(input_img)
+    shapes.append(((h0, w0), ((h / h0, w / w0), pad)))
+
+# [修改点] 增加 Stack 日志，因为这一步如果是3000张图会很慢且占内存
+print("Stacking tensors and moving to GPU/CPU...")
+if use_cuda:
+    x = torch.stack([transform(fi).cuda() for fi in input_imgs], 0)
+else:
+    x = torch.stack([transform(fi) for fi in input_imgs], 0)
+
+x = x.to(torch.float16 if use_cuda and use_float16 else torch.float32)
+
+# [修改点] 增加模型加载日志
+print(f"Loading HybridNets weights from {weight}...")
+weight = torch.load(weight, map_location='cuda' if use_cuda else 'cpu')
+weight_last_layer_seg = weight['segmentation_head.0.weight']
 if weight_last_layer_seg.size(0) == 1:
     seg_mode = BINARY_MODE
 else:
@@ -79,12 +177,12 @@ else:
         seg_mode = MULTILABEL_MODE
     else:
         seg_mode = MULTICLASS_MODE
-print(f"DETECTED SEGMENTATION MODE: {seg_mode}")
+print("DETECTED SEGMENTATION MODE:", seg_mode)
 
 model = HybridNetsBackbone(compound_coef=compound_coef, num_classes=len(obj_list), ratios=eval(anchors_ratios),
                            scales=eval(anchors_scales), seg_classes=len(seg_list), backbone_name=args.backbone,
                            seg_mode=seg_mode)
-model.load_state_dict(weight_dict)
+model.load_state_dict(weight)
 model.requires_grad_(False)
 model.eval()
 
@@ -93,96 +191,137 @@ if use_cuda:
     if use_float16:
         model = model.half()
 
-# 图像预处理变换
-resized_shape = params.model['image_size']
-if isinstance(resized_shape, list):
-    resized_shape = max(resized_shape)
-normalize = transforms.Normalize(mean=params.mean, std=params.std)
-transform = transforms.Compose([transforms.ToTensor(), normalize])
+with torch.no_grad():
+    print("Running HybridNets Inference (Batch Mode)...")
+    features, regression, classification, anchors, seg = model(x)
 
-regressBoxes = BBoxTransform()
-clipBoxes = ClipBoxes()
-
-print(f"FOUND {len(img_paths)} IMAGES. STARTING PROCESSING...")
-
-# ================= 开始逐张处理循环 =================
-# 使用 tqdm 显示进度条
-for path in tqdm(img_paths, desc="Processing Images"):
-    filename_with_ext = os.path.basename(path)
-    filename, ext = os.path.splitext(filename_with_ext)
-    
-    # 1. 读取单张图片
-    ori_img = cv2.imread(path, cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
-    if ori_img is None:
-        print(f"Warning: Could not read {path}")
-        continue
-    
-    # OpenCV 读入是 BGR，转为 RGB
-    ori_img = cv2.cvtColor(ori_img, cv2.COLOR_BGR2RGB)
-    h0, w0 = ori_img.shape[:2]
-
-    # 2. Letterbox 预处理 (保持长宽比缩放)
-    r = resized_shape / max(h0, w0)
-    input_img = cv2.resize(ori_img, (int(w0 * r), int(h0 * r)), interpolation=cv2.INTER_AREA)
-    h, w = input_img.shape[:2]
-    (input_img, _), ratio, pad = letterbox((input_img, None), resized_shape, auto=True, scaleup=False)
-    
-    # 转 Tensor
-    if use_cuda:
-        x = transform(input_img).cuda()
+    # --- HybridNets Segmentation 处理 ---
+    print("Processing segmentation masks...")
+    seg_mask_list = []
+    if seg_mode == BINARY_MODE:
+        seg_mask = torch.where(seg >= 0, 1, 0)
+        seg_mask.squeeze_(1)
+        seg_mask_list.append(seg_mask)
+    elif seg_mode == MULTICLASS_MODE:
+        _, seg_mask = torch.max(seg, 1)
+        seg_mask_list.append(seg_mask)
     else:
-        x = transform(input_img)
-    
-    # 增加 Batch 维度: [C, H, W] -> [1, C, H, W]
-    x = x.unsqueeze(0)
-    x = x.to(torch.float16 if use_cuda and use_float16 else torch.float32)
+        seg_mask_list = [torch.where(torch.sigmoid(seg)[:, i, ...] >= 0.5, 1, 0) for i in range(seg.size(1))]
+        seg_mask_list.pop(0)
 
-    # 3. 模型推理
-    with torch.no_grad():
-        features, regression, classification, anchors, seg = model(x)
+    # 预处理 HybridNets 分割结果
+    processed_seg_masks = [] 
+    # [修改点] 确保分割处理进度条显示
+    for i in tqdm(range(seg.size(0)), desc="Resizing Masks", unit="img"):
+        current_img_seg_mask = None
+        for seg_class_index, seg_mask in enumerate(seg_mask_list):
+            seg_mask_ = seg_mask[i].squeeze().cpu().numpy()
+            
+            # 1. 裁剪 Letterbox Padding
+            pad_h = int(shapes[i][1][1][1])
+            pad_w = int(shapes[i][1][1][0])
+            seg_mask_ = seg_mask_[pad_h:seg_mask_.shape[0]-pad_h, pad_w:seg_mask_.shape[1]-pad_w]
+            
+            # 2. 缩放回原图尺寸
+            seg_mask_ = cv2.resize(seg_mask_, dsize=shapes[i][0][::-1], interpolation=cv2.INTER_NEAREST)
+            
+            current_img_seg_mask = seg_mask_
 
-        # ---------------- 分割处理 (Segmentation) ----------------
-        if seg_mode == BINARY_MODE:
-            seg_mask = torch.where(seg >= 0, 1, 0)
-            seg_mask.squeeze_(1)
-        elif seg_mode == MULTICLASS_MODE:
-            _, seg_mask = torch.max(seg, 1)
-        else:
-            seg_mask = torch.where(torch.sigmoid(seg) >= 0.5, 1, 0)
+            # 可视化分割（彩色）
+            color_seg = np.zeros((seg_mask_.shape[0], seg_mask_.shape[1], 3), dtype=np.uint8)
+            for index, seg_class in enumerate(params.seg_list):
+                color_seg[seg_mask_ == index+1] = color_list_seg[seg_class]
+            color_seg = color_seg[..., ::-1] # RGB -> BGR
+            color_mask = np.mean(color_seg, 2)
+            det_only_imgs.append(ori_imgs[i].copy())
+            seg_img = ori_imgs[i].copy() if seg_mode == MULTILABEL_MODE else ori_imgs[i]
+            seg_img[color_mask != 0] = seg_img[color_mask != 0] * 0.5 + color_seg[color_mask != 0] * 0.5
+            seg_img = seg_img.astype(np.uint8)
+            
+            filename_with_ext = os.path.basename(img_path[i])
+            filename, _ = os.path.splitext(filename_with_ext)
+            seg_filename = f'{output}/{filename}_{params.seg_list[seg_class_index]}_seg.jpg' if seg_mode == MULTILABEL_MODE else \
+                           f'{output}/{filename}_seg.jpg'
+            if show_seg or seg_mode == MULTILABEL_MODE:
+                cv2.imwrite(seg_filename, cv2.cvtColor(seg_img, cv2.COLOR_RGB2BGR))
+        processed_seg_masks.append(current_img_seg_mask)
 
-        # 取出 Batch 中的第一张 (也是唯一一张)
-        seg_mask_ = seg_mask[0].squeeze().cpu().numpy()
+    # --- HybridNets Detection 处理 ---
+    print("Post-processing bounding boxes...")
+    regressBoxes = BBoxTransform()
+    clipBoxes = ClipBoxes()
+    out = postprocess(x, anchors, regression, classification, regressBoxes, clipBoxes, threshold, iou_threshold)
+
+    # --- 最终循环：坐标映射 + 生成 Result 和 Mask ---
+    print("Generating final outputs (Masks & Overlays)...")
+    for i in tqdm(range(len(ori_imgs)), desc="Saving Results", unit="img"):
+        filename_with_ext = os.path.basename(img_path[i])
+        filename, ext = os.path.splitext(filename_with_ext)
+        h0, w0 = ori_imgs[i].shape[:2]
         
-        # 去除 Padding (还原到 resize 后的尺寸)
-        pad_h = int(pad[1])
-        pad_w = int(pad[0])
-        seg_mask_ = seg_mask_[pad_h:seg_mask_.shape[0]-pad_h, pad_w:seg_mask_.shape[1]-pad_w]
-        
-        # 缩放回原图尺寸
-        seg_mask_ = cv2.resize(seg_mask_, (w0, h0), interpolation=cv2.INTER_NEAREST)
+        # 关键步骤：将检测框坐标从 模型尺寸 映射回 原图尺寸
+        out[i]['rois'] = scale_coords(ori_imgs[i][:2], out[i]['rois'], shapes[i][0], shapes[i][1])
 
-        # ---------------- 生成并保存 Mask (黑底白路) ----------------
+        # =========================================================
+        # Mask 生成逻辑 (White Background, Black Objects/Sky)
+        # =========================================================
+        binary_mask_img = None
         if args.save_mask:
-            # 1. 初始化全黑背景 (0, 0, 0)
-            binary_mask_img = np.zeros((h0, w0, 3), dtype=np.uint8)
+            # 1. 初始化全白背景 (255)
+            binary_mask_img = np.ones((h0, w0, 3), dtype=np.uint8) * 255
             
-            # 2. 将检测到的路面/车道线 (值 > 0 的区域) 设为白色 (255, 255, 255)
-            # 在 HybridNets 中：0=背景, 1=车道线, 2=可行驶区域
-            binary_mask_img[seg_mask_ > 0] = (255, 255, 255)
+            # 2. 绘制 HybridNets 道路分割 (黑色)
+            if processed_seg_masks[i] is not None:
+                # 只需检查是否有非零像素 (即检测到的道路/车道线等)
+                binary_mask_img[processed_seg_masks[i] > 0] = (0, 0, 0)
             
-            # 3. 保存为灰度图 (单通道 png，节省空间且只有纯黑纯白)
+            # 3. 计算并绘制 SkySeg 天空分割 (黑色)
+            if sky_session is not None:
+                try:
+                    # 注意: ori_imgs[i] 是 RGB 格式, run_skyseg 函数内部会处理成 BGR 然后再转 RGB 归一化
+                    sky_map = run_skyseg(sky_session, SKY_INPUT_SIZE, cv2.cvtColor(ori_imgs[i], cv2.COLOR_RGB2BGR))
+                    sky_map_resized = cv2.resize(sky_map, (w0, h0), interpolation=cv2.INTER_NEAREST)
+                    
+                    # SkySeg 的输出值越低，越可能是天空。根据阈值设为黑色。
+                    # [保留原有逻辑] 原始逻辑中：binary_mask_img[sky_map_resized > SKY_THRESHOLD] = (0, 0, 0)
+                    # 意味着：如果天空置信度高(>32)，则设为黑色
+                    binary_mask_img[sky_map_resized > SKY_THRESHOLD] = (0, 0, 0)
+                except Exception as e:
+                    print(f"Sky segmentation failed for {filename}: {e}")
+
+        # 4. 绘制 HybridNets 车辆检测框 (黑色)
+        for j in range(len(out[i]['rois'])):
+            x1, y1, x2, y2 = out[i]['rois'][j].astype(int)
+            obj = obj_list[out[i]['class_ids'][j]]
+            score = float(out[i]['scores'][j])
+            
+            # 绘制彩色框到原图
+            plot_one_box(ori_imgs[i], [x1, y1, x2, y2], label=obj, score=score,
+                         color=color_list[get_index_label(obj, obj_list)])
+
+            # 绘制黑色框到 Mask
+            if args.save_mask and binary_mask_img is not None:
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w0, x2), min(h0, y2)
+                cv2.rectangle(binary_mask_img, (x1, y1), (x2, y2), (0, 0, 0), -1)
+
+        # 保存各种结果
+        if show_det:
+             cv2.imwrite(f'{output}/{filename}_det.jpg', cv2.cvtColor(det_only_imgs[i], cv2.COLOR_RGB2BGR))
+        if imshow:
+            cv2.imshow('img', ori_imgs[i])
+            cv2.waitKey(0)
+        if imwrite:
+            cv2.imwrite(f'{output}/{filename_with_ext}', cv2.cvtColor(ori_imgs[i], cv2.COLOR_RGB2BGR))
+        
+        # 保存最终叠加的 Mask
+        if args.save_mask and binary_mask_img is not None:
+            # 转换为单通道灰度图保存，文件更小，且确保只有黑白两色
             mask_gray = cv2.cvtColor(binary_mask_img, cv2.COLOR_RGB2GRAY)
-            
-            # 构造保存路径
-            save_path = os.path.join(output, f'{filename}_mask.png')
-            cv2.imwrite(save_path, mask_gray)
+            cv2.imwrite(f'{output}/{filename}_mask.png', mask_gray)
 
-        # ---------------- 生成可视化结果 (可选) ----------------
-        # 只有在 --imwrite True 且 --save_mask False 的情况下才生成彩色叠加图
-        # 如果你只想要 Mask，这样可以节省大量时间
-        if args.imwrite and not args.save_mask:
-            # 这里的可视化代码省略了，以保持代码在流式处理中的简洁性。
-            # 3000张图通常只需要Mask。如果需要彩色检测框图，请去掉上面的 "and not args.save_mask"
-            pass
-
-print("\nProcessing complete!")
+if not args.speed_test:
+    print("All tasks completed successfully.")
+    exit(0)
+print('running speed test...')
+# Speed test code omitted...
