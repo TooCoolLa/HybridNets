@@ -1,0 +1,1 @@
+python hybridnets_test_mask.py --source demo/image --output demo_result --save_mask True -w ./weights/hybridnets.pth --imwrite False
