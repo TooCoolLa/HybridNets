@@ -70,7 +70,7 @@ threshold = args.conf_thresh
 iou_threshold = args.iou_thresh
 
 # 加载权重
-weight_dict = torch.load(weight, map_location='cuda' if use_cuda else 'cpu',weights_only=True)
+weight_dict = torch.load(weight, map_location='cuda' if use_cuda else 'cpu',weights_only=False)
 weight_last_layer_seg = weight_dict['segmentation_head.0.weight']
 if weight_last_layer_seg.size(0) == 1:
     seg_mode = BINARY_MODE
