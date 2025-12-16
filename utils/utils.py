@@ -311,8 +311,24 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
         gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
         pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
     else:
-        gain = ratio_pad[0][0]
-        pad = ratio_pad[1]
+        # ratio_pad historically is ((gain_w, gain_h), (pad_w, pad_h)).
+        # But some callers may pass only the pad tuple or a scalar gain. Handle these cases robustly.
+        try:
+            gain = ratio_pad[0][0]
+            pad = ratio_pad[1]
+        except Exception:
+            # If ratio_pad is a (pad_w, pad_h) tuple/list, derive gain from shapes
+            if isinstance(ratio_pad, (list, tuple)) and len(ratio_pad) == 2 and all(isinstance(x, (int, float)) for x in ratio_pad):
+                pad = ratio_pad
+                gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])
+            # If ratio_pad is a scalar (gain), use it and assume no padding
+            elif isinstance(ratio_pad, (int, float)):
+                gain = float(ratio_pad)
+                pad = (0.0, 0.0)
+            else:
+                # Fallback: compute gain/pad from shapes to preserve original behaviour
+                gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])
+                pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
 
     coords[:, [0, 2]] -= pad[0]  # x padding
     coords[:, [1, 3]] -= pad[1]  # y padding
