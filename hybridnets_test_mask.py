@@ -329,7 +329,7 @@ for chunk_idx in tqdm(range(tqdm_chunk_size_count), desc="Processing Chunks", un
             if args.save_mask and binary_mask_img is not None:
                 # 转换为单通道灰度图保存，文件更小，且确保只有黑白两色
                 mask_gray = cv2.cvtColor(binary_mask_img, cv2.COLOR_RGB2GRAY)
-                cv2.imwrite(f'{output}/{filename}_mask.png', mask_gray)
+                cv2.imwrite(f'{output}/{filename}.png', mask_gray)
 
 if not args.speed_test:
     print("All tasks completed successfully.")
