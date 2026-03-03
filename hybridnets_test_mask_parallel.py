@@ -176,8 +176,8 @@ def main():
     parser.add_argument('--cuda', type=boolean_string, default=True)
     parser.add_argument('--float16', type=boolean_string, default=True, help="Use float16")
     parser.add_argument('--save_mask', type=boolean_string, default=False, help="Save binary mask")
-    parser.add_argument('-ps','--patch_size', type=int, default=12, help='Patch size (Batch size)') 
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of parallel workers for IO/Pre-process')
+    parser.add_argument('-ps','--patch_size', type=int, default=100, help='Patch size (Batch size)') 
+    parser.add_argument('--num_workers', type=int, default=16, help='Number of parallel workers for IO/Pre-process')
     args = parser.parse_args()
     
     # Increase patch size default for better GPU utilization since we optimized loading

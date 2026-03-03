@@ -86,6 +86,17 @@ if output.endswith("/"):
     output = output[:-1]
 weight = args.load_weights
 img_path = glob(f'{source}/*.jpg') + glob(f'{source}/*.png')
+img_path.sort()
+
+# 检查是否已存在 mask，如果存在则跳过
+if args.save_mask:
+    print("Checking for existing masks to skip...")
+    img_path = [
+        path for path in img_path
+        if not os.path.exists(f'{output}/{os.path.splitext(os.path.basename(path))[0]}.png')
+    ]
+    print(f"Remaining images to process: {len(img_path)}")
+
 input_imgs = []
 shapes = []
 det_only_imgs = []
@@ -170,6 +181,7 @@ for chunk_idx in tqdm(range(tqdm_chunk_size_count), desc="Processing Chunks", un
     input_imgs = []
     shapes = []
     det_only_imgs = []
+
     # --- 读取并预处理图像 ---
     # [修改点] 确保预处理进度条显示
     print("Preprocessing images (Resize & Letterbox)...")
